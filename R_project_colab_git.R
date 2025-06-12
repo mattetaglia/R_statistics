@@ -8,22 +8,22 @@ library(tidyverse)
 library(car) # vif
 library(glmnet) # LASSO
 library(moments) # jarque.test
-library(caret) # validazione esterna
+library(caret) # external validation
 library(DataExplorer)
-
-print("Libraries loaded")
-
+library(zoo)
+library(imputeTS)
+library(readr)
+library(tseries)
+library(moments)
+library(lmtest)
 
 #Dataset import
-
-library(readr)
 Agrimonia_Dataset <- read_csv("/Users/nicolasilvestri/Desktop/Unibg/Statistics/PART 1/R scripts and data/Databases/Agrimonia_Dataset_v_3_0_0.csv") #From .csv
 Metadata_stations <- read_csv("/Users/nicolasilvestri/Desktop/Unibg/Statistics/PART 1/R scripts and data/Databases/Metadata_monitoring_network_registry_v_2_0_1.csv")
 
-# load(file = "Agrimonia_Dataset_v_3_0_0.Rdata") #From R
-# Agrimonia_Dataset <- AgrImOnIA_Dataset_v_3_0_0
-# rm(list="AgrImOnIA_Dataset_v_3_0_0")
+#-------------------------------------------------------------------------------
 
+#Preliminary data handling
 Stations_name <- Metadata_stations %>%
   select(IDStation, NameStation, Province) %>%
   distinct(IDStation, .keep_all = TRUE)
@@ -37,9 +37,6 @@ Agrimonia_Dataset$Month <- lubridate::month(Agrimonia_Dataset$Time, label = TRUE
 Agrimonia_Dataset <- Agrimonia_Dataset %>% select(IDStations:Time, Month, everything())
 mesi_italiani <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun",
                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-
-#mesi_italiani <- c("gen", "feb", "mar", "apr", "mag", "giu",
-#"lug", "ago", "set", "ott", "nov", "dic")
 
 Agrimonia_Dataset <- Agrimonia_Dataset %>%
   mutate(
@@ -60,6 +57,15 @@ stations_id   <- c(504, 583, 697)
 
 DB <- Agrimonia_Dataset %>% 
   filter(IDStations %in% stations_id)
+
+#Creating day_of_year and trend_time columns
+DB$day_of_year <- yday(DB$Time)
+DB$Trend <- as.numeric(DB$Time)
+
+# transforming Stations_name into categorical data
+DB$NameStation <- as.factor(DB$NameStation)
+
+
 MI_DB <- DB %>% 
   filter(IDStations==504)
 BG_DB <- DB %>% 
@@ -67,6 +73,7 @@ BG_DB <- DB %>%
 MN_DB <- DB %>% 
   filter(IDStations==697)
 
+#-------------------------------------------------------------------------------
 
 #Preliminary data analysis
 
@@ -88,16 +95,10 @@ ggplot(DB, aes(x = Time, y = AQ_nox, color=Province)) +
 ggplot(DB, aes(x  = AQ_nox, color=Province)) +
   geom_density(size=1.5)+ theme_minimal() +
   theme(legend.position = "bottom")
-# Create full HTML report
-#create_report(DB,
-#              y = "Province",
-#              config = configure_report(add_plot_prcomp = FALSE),
-#              output_file = "EDA_Prov_Report.html")
 
-#From here new changes applied by nick99silver to be approved from group
 ggplot(DB, aes(x = Time, y = AQ_nox)) +
-  geom_point() + 
-  geom_smooth(method = "lm", se = FALSE) +
+  geom_point(aes(color = Season)) +  
+  geom_smooth(method = "lm", se = FALSE, color = "black") + 
   facet_wrap(~ Province) +
   labs(title = "AQ_nox over time by Province") +
   theme_minimal() +
@@ -105,13 +106,11 @@ ggplot(DB, aes(x = Time, y = AQ_nox)) +
 
 # Create a scatter plot with a linear regression line
 ggplot(DB, aes(x = Time, y = AQ_nox)) +
-  geom_point() + 
-  geom_smooth(method = "lm", se = FALSE) +
+  geom_point(aes(color=Season)) + 
+  geom_smooth(method = "lm", se = FALSE, color="black") +
   labs(title = "AQ_nox over time") +
   theme_minimal() +
   theme(legend.position = "bottom")
-
-
 
 # Create a plot showing the average AQ_nox by day of the week
 ggplot(DB, aes(x = Day_of_week, y = AQ_nox)) +
@@ -128,180 +127,165 @@ ggplot(MI_DB, aes(x = Day_of_week, y = AQ_nox)) +
   geom_boxplot(outlier.alpha = 0.2) +
   stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", linewidth = 1.2) +
   stat_summary(fun = mean, geom = "point", color = "red", size = 2) +
-  labs(title = "AQ_nox by Day of the Week (Mean Highlighted)",
-       y = "NOₓ Concentration (µg/m³)") +
+  labs(title = "AQ_nox by Day of the Week in Milano (Mean Highlighted)",
+       y = "NOₓ Concentration") +
   theme_minimal() +
   scale_x_discrete(limits = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
 
-library(zoo)
-
-# Interpola direttamente nella colonna AQ_nox
+# AQ_nox interpolation
 DB$AQ_nox <- na.approx(DB$AQ_nox)
 
-sum(is.na(DB$AQ_nox))  
+#testing stationarity
+# Augmented Dickey-Fuller test for stationarity of AQ_nox
+adf_result <- adf.test(DB$AQ_nox)
+print(adf_result)
 
-# Split data into training and test sets
-set.seed(123)
-train_index <- sample(1:nrow(DB), 0.8 * nrow(DB))
-train_data <- DB[train_index, ]
-test_data <- DB[-train_index, ]
+#-------------------------------------------------------------------------------
 
-# Build multiple linear regression model
-nox_model <- lm(AQ_nox ~ Time + Month_num + Day_of_week + Province, data = train_data)
+#NA manipulation
 
-# Print model summary
-summary(nox_model)
+#select only considered columns
+MI_DB <- MI_DB %>%
+  select(IDStations,AQ_pm25, AQ_nox, WE_temp_2m, WE_wind_speed_10m_mean, WE_wind_speed_10m_max,
+         WE_wind_speed_100m_mean, WE_wind_speed_100m_max, WE_tot_precipitation, WE_surface_pressure,
+         WE_solar_radiation, WE_rh_mean, WE_blh_layer_min, WE_blh_layer_max, Month_num, Season, Day_of_week, 
+         day_of_year, Trend)
+BG_DB <- BG_DB %>%
+  select(IDStations,AQ_pm25, AQ_nox, WE_temp_2m, WE_wind_speed_10m_mean, WE_wind_speed_10m_max,
+         WE_wind_speed_100m_mean, WE_wind_speed_100m_max, WE_tot_precipitation, WE_surface_pressure,
+         WE_solar_radiation, WE_rh_mean, WE_blh_layer_min, WE_blh_layer_max, Month_num, Season, Day_of_week, 
+         day_of_year, Trend)
+MN_DB <- MN_DB %>%
+  select(IDStations,AQ_pm25, AQ_nox, WE_temp_2m, WE_wind_speed_10m_mean, WE_wind_speed_10m_max,
+         WE_wind_speed_100m_mean, WE_wind_speed_100m_max, WE_tot_precipitation, WE_surface_pressure,
+         WE_solar_radiation, WE_rh_mean, WE_blh_layer_min, WE_blh_layer_max, Month_num, Season, Day_of_week, 
+         day_of_year, Trend)
 
-# Make predictions on test set
-predictions <- predict(nox_model, newdata = test_data)
-
-sum(is.na(predictions))  # Controlla se ci sono valori NA nelle previsioni
-
-# Calculate RMSE
-rmse <- sqrt(mean((test_data$AQ_nox - predictions)^2, na.rm = TRUE))
-cat("Root Mean Square Error:", rmse, "\n")
-
-# Plot actual vs predicted values
-ggplot(data.frame(actual = test_data$AQ_nox, predicted = predictions), 
-       aes(x = actual, y = predicted)) +
-  geom_point(alpha = 0.5) +
-  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
-  labs(title = "Actual vs Predicted NOx Values",
-       x = "Actual NOx",
-       y = "Predicted NOx") +
-  theme_minimal()
-
-# Calculate residuals
-residuals <- test_data$AQ_nox - predictions
-
-# Control for NA values in residuals
-sum(is.na(residuals))
-
-
-
-# Create a data frame with residuals and actual values
-residual_df <- data.frame(
-  actual = test_data$AQ_nox,
-  predicted = predictions,
-  residuals = residuals,
-  time = test_data$Time
+#Applying kalman to all numeric columns in my dataset
+vars_to_impute <- c(
+  "AQ_pm25", "AQ_nox", "WE_temp_2m", "WE_wind_speed_10m_mean", "WE_wind_speed_10m_max",
+  "WE_wind_speed_100m_mean", "WE_wind_speed_100m_max", "WE_tot_precipitation", "WE_surface_pressure",
+  "WE_solar_radiation", "WE_rh_mean", "WE_blh_layer_min", "WE_blh_layer_max"
 )
 
-# Plot residuals vs predicted values
-ggplot(residual_df, aes(x = predicted, y = residuals)) +
-  geom_point(alpha = 0.5) +
-  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
-  geom_smooth(method = "loess", se = TRUE) +
-  labs(title = "Residuals vs Predicted Values",
-       x = "Predicted Values",
-       y = "Residuals") +
+for (col in vars_to_impute) {
+  if (col %in% names(BG_DB)) {
+    BG_DB[[col]] <- na_kalman(ts(BG_DB[[col]], frequency = 365), model = "auto.arima")
+  }
+}
+
+#plotting NA to be fitted
+ggplot_na_imputations(ts_data, ts_filled) +
+  labs(title = "NA Imputation using Kalman Filter")
+
+#creating a new database with the fitted values
+DB_fitted <- DB %>%
+  mutate(AQ_nox = ts_filled)
+
+# Plot the original and filled time series  
+ggplot_na_imputations(ts_data, ts_filled)
+
+# Plot the distribution of AQ_nox after Kalman filtering
+hist(DB_fitted$AQ_nox, main = "Distribution after Kalman", col = "skyblue")
+
+#transforming categorical variables into factors
+DB_fitted$Day_of_week <- as.factor(DB_fitted$Day_of_week)
+DB_fitted$Season <- as.factor(DB_fitted$Season)
+DB_fitted$WE_mode_wind_direction_100m <- as.factor(DB_fitted$WE_mode_wind_direction_100m)
+DB_fitted$WE_mode_wind_direction_10m <- as.factor(DB_fitted$WE_mode_wind_direction_10m)
+
+#Dropping constant columns or all NAs and useless chr
+DB_fitted <- DB_fitted[, sapply(DB_fitted, function(x) {
+  !all(is.na(x)) && length(unique(na.omit(x))) > 1
+})]
+DB_fitted <- DB_fitted[, !(names(DB_fitted) %in% c("Province", "IDStations"))]
+
+#-------------------------------------------------------------------------------
+
+#Lasso on global database - NOT USED IN THE REPORT
+
+#Use LASSO to create best model with best possible variable selection
+# Prepare matrix (X) and target (y)
+X <- model.matrix(AQ_nox ~ . -1, data = DB_clean)
+y <- DB_clean$AQ_nox
+
+dim(X)  # Check dimensions of X
+
+# Run LASSO with cross-validation
+lasso_cv <- cv.glmnet(X, y, alpha = 1)
+
+# Best lambda
+best_lambda <- lasso_cv$lambda.min
+
+# Final model
+model <- glmnet(X, y, alpha = 1, lambda = best_lambda)
+
+# Coefficients
+coef(model)
+
+plot(lasso_cv)
+title("Cross-Validation Error vs Lambda") +
+  xlab("Lambda") +
+  ylab("Cross-Validation Error") +
   theme_minimal()
 
-# Plot residuals vs time
-ggplot(residual_df, aes(x = time, y = residuals)) +
-  geom_point(alpha = 0.5) +
-  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
-  geom_smooth(method = "loess", se = TRUE) +
-  labs(title = "Residuals vs Time",
-       x = "Time",
-       y = "Residuals") +
-  theme_minimal()
+#Residual analysis
+fitted_vals <- as.numeric(predict(model, newx = X))
+residuals   <- y - fitted_vals
 
-# Plot residuals histogram with normal curve
-ggplot(residual_df, aes(x = residuals)) +
-  geom_histogram(aes(y = ..density..), bins = 30, fill = "lightblue", color = "black") +
-  stat_function(fun = dnorm, args = list(mean = mean(residual_df$residuals), 
-                                       sd = sd(residual_df$residuals)),
-                color = "red", size = 1) +
-  labs(title = "Distribution of Residuals",
-       x = "Residuals",
-       y = "Density") +
-  theme_minimal()
-
-# Calculate and plot autocorrelation of residuals
-acf_residuals <- acf(residuals, plot = FALSE)
-plot(acf_residuals, main = "Autocorrelation of Residuals")
-
-# Durbin-Watson test for autocorrelation
-library(lmtest)
-dwtest(nox_model)
-
-# Shapiro-Wilk test for normality of residuals
-shapiro.test(residuals)
-
-# Print summary statistics of residuals
-cat("\nResiduals Summary Statistics:\n")
+# Summary statistics
 summary(residuals)
-cat("\nStandard Deviation of Residuals:", sd(residuals), "\n")
+sd(residuals)
 
-# Load required package for ARMA modeling
-#install.packages("forecast")
-library(forecast)
+# Histogram + density
+hist(residuals,
+     main = "Histogram of Residuals",
+     xlab = "Residual",
+     col  = "lightgray",
+     border = "white")
+lines(density(residuals), lwd = 2)
 
-# Convert residuals to time series object
-residuals_ts <- ts(residuals, frequency = 24)  # Assuming hourly data
+#normality check
+# QQ‐plot
+qqnorm(residuals)
+qqline(residuals, col = "red", lwd = 2)
 
-# Find best ARMA model using auto.arima
-best_arma <- auto.arima(residuals_ts, 
-                       seasonal = TRUE,
-                       stepwise = FALSE,
-                       approximation = FALSE,
-                       trace = TRUE)
+# Formal tests
+shapiro.test(residuals)      # Shapiro–Wilk
+jarque.test(residuals)       # Jarque–Bera
 
-# Print the best model summary
-print(summary(best_arma))
+#Homoscedasticity (constant variance)
+# Residuals vs fitted
+ggplot(data.frame(fitted = fitted_vals, resid = residuals), 
+       aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Fitted",
+       x = "Fitted values",
+       y = "Residuals") +
+  theme_minimal()
 
-# Get the residuals from the ARMA model
-arma_residuals <- residuals(best_arma)
+# Breusch–Pagan test
+# need a linear model wrapper for bp test:
+lm_wrapper <- lm(resid ~ fitted, data = data.frame(resid = residuals, fitted = fitted_vals))
+bptest(lm_wrapper)
 
-# Plot the original residuals vs ARMA model residuals
-par(mfrow = c(2, 2))
-plot(residuals_ts, main = "Original Residuals")
-plot(arma_residuals, main = "ARMA Model Residuals")
-acf(residuals_ts, main = "ACF of Original Residuals")
-acf(arma_residuals, main = "ACF of ARMA Residuals")
+# ACF plot
+acf(residuals, main = "ACF of Residuals")
 
-# Test for autocorrelation in ARMA residuals
-Box.test(arma_residuals, type = "Ljung-Box")
+# Ljung–Box test (e.g. up to lag 24 for hourly data)
+Box.test(residuals, lag = 24, type = 
+"Ljung-Box")
 
-# Shapiro test for normality of ARMA residuals
-shapiro.test(arma_residuals)
+#Residuals over time / by station
+# If you want to see time patterns, bind back into DB_clean:
+DB_clean$resid <- residuals
+DB_clean$fitted <- fitted_vals
+DB_clean$Time   <- Agrimonia_Dataset$Time[!is.na(Agrimonia_Dataset$AQ_nox)]  # align timestamps
 
-# Create a new model that combines the original regression with ARMA
-# First, get the fitted values from the original model
-fitted_values <- fitted(nox_model)
-
-# Create a new time series with the original data
-y_ts <- ts(train_data$AQ_nox, frequency = 24)
-
-# Fit ARIMA model to the original data
-best_arima <- auto.arima(y_ts, 
-                        xreg = model.matrix(nox_model)[,-1],  # Remove intercept
-                        seasonal = TRUE,
-                        stepwise = FALSE,
-                        approximation = FALSE)
-
-# Print the combined model summary
-print(summary(best_arima))
-
-# Make predictions with the new model
-new_xreg <- model.matrix(nox_model, data = test_data)[,-1]  # Remove intercept
-arima_forecast <- forecast(best_arima, xreg = new_xreg, h = nrow(test_data))
-
-# Calculate new RMSE
-new_rmse <- sqrt(mean((test_data$AQ_nox - arima_forecast$mean)^2, na.rm = TRUE))
-cat("\nNew RMSE with ARIMA model:", new_rmse, "\n")
-
-# Compare original and new residuals
-par(mfrow = c(2, 2))
-plot(residuals, main = "Original Model Residuals")
-plot(arima_forecast$residuals, main = "ARIMA Model Residuals")
-acf(residuals, main = "ACF of Original Residuals")
-acf(arima_forecast$residuals, main = "ACF of ARIMA Residuals")
-
-# Test for autocorrelation in new residuals
-Box.test(arima_forecast$residuals, type = "Ljung-Box")
-
-# Shapiro test for new residuals
-shapiro.test(arima_forecast$residuals)
-
+ggplot(DB_clean, aes(x = Time, y = resid, color = Season)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(se = FALSE, color = "black") +
+  facet_wrap(~ NameStation) +
+  labs(title = "Residuals over Time by Station") +
+  theme_minimal()
